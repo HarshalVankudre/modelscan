@@ -1480,7 +1480,11 @@ def test_scan_directory_path(file_path: str) -> None:
             "source": "password_protected.zip",
         },
     ]
-    assert results["errors"] == []
+    # malicious14.pkl ends with bytes that are not a pickle: its issue is
+    # reported, and so is the fact that the scanner could not parse the end
+    assert [(error["category"], error["source"]) for error in results["errors"]] == [
+        ("PICKLE_GENOPS", "malicious14.pkl")
+    ]
 
 
 @pytest.mark.parametrize(
