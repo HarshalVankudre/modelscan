@@ -14,6 +14,7 @@ from modelscan.error import (
     ErrorBase,
     ModelScanScannerError,
     NestedZipError,
+    BadZipError,
 )
 from modelscan.skip import ModelScanSkipped, SkipCategories
 from modelscan.issues import Issues, IssueSeverity
@@ -95,37 +96,74 @@ class ModelScan:
                     continue
 
                 try:
-                    with zipfile.ZipFile(model.get_stream(), "r") as zip:
-                        file_names = zip.namelist()
-                        for file_name in file_names:
-                            with zip.open(file_name, "r") as file_io:
-                                file_name = f"{model.get_source()}:{file_name}"
-                                if _is_zipfile(file_name, data=file_io):
-                                    self._errors.append(
-                                        NestedZipError(
-                                            "ModelScan does not support nested zip files.",
-                                            Path(file_name),
-                                        )
-                                    )
-                                    continue
-
-                                member = Model(file_name, file_io)
-                                member.set_context("container", str(model.get_source()))
-                                yield member
+                    zip = zipfile.ZipFile(model.get_stream(), "r")
                 except (zipfile.BadZipFile, RuntimeError) as e:
+                    # The content of the archive was not scanned: report an
+                    # error, not a skip
                     logger.debug(
-                        "Skipping zip file %s, due to error",
+                        "Could not read zip file %s",
                         str(model.get_source()),
                         exc_info=True,
                     )
-                    self._skipped.append(
-                        ModelScanSkipped(
-                            "ModelScan",
-                            SkipCategories.BAD_ZIP,
-                            f"Skipping zip file due to error: {e}",
-                            str(model.get_source()),
+                    self._errors.append(
+                        BadZipError(
+                            f"Could not read zip file: {e}",
+                            model.get_source(),
                         )
                     )
+                    continue
+
+                with zip:
+                    for file_name in zip.namelist():
+                        # Handle every entry on its own: an entry that cannot
+                        # be read must not hide the entries after it
+                        entry_source = f"{model.get_source()}:{file_name}"
+                        try:
+                            file_io = zip.open(file_name, "r")
+                        except RuntimeError as e:
+                            # Encrypted entry: no loader can read it without
+                            # the password
+                            logger.debug(
+                                "Skipping zip entry %s, due to error",
+                                entry_source,
+                                exc_info=True,
+                            )
+                            self._skipped.append(
+                                ModelScanSkipped(
+                                    "ModelScan",
+                                    SkipCategories.BAD_ZIP,
+                                    f"Skipping zip entry due to error: {e}",
+                                    entry_source,
+                                )
+                            )
+                            continue
+                        except (zipfile.BadZipFile, NotImplementedError) as e:
+                            logger.debug(
+                                "Could not read zip entry %s",
+                                entry_source,
+                                exc_info=True,
+                            )
+                            self._errors.append(
+                                BadZipError(
+                                    f"Could not read zip entry: {e}",
+                                    Path(entry_source),
+                                )
+                            )
+                            continue
+
+                        with file_io:
+                            if _is_zipfile(entry_source, data=file_io):
+                                self._errors.append(
+                                    NestedZipError(
+                                        "ModelScan does not support nested zip files.",
+                                        Path(entry_source),
+                                    )
+                                )
+                                continue
+
+                            member = Model(entry_source, file_io)
+                            member.set_context("container", str(model.get_source()))
+                            yield member
 
     def scan(
         self,
