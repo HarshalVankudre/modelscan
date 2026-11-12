@@ -50,73 +50,107 @@ class GenOpsError(Exception):
 def _list_globals(
     data: IO[bytes], multiple_pickles: bool = True
 ) -> Set[Tuple[str, str]]:
+    """Return the globals referenced by the pickle(s) in data.
+
+    Raises GenOpsError if the stream cannot be fully parsed. The error carries
+    every global found up to that point (including those of the pickle that
+    failed to parse), because a loader executes the opcodes it has already
+    read before it reaches malformed bytes.
+    """
     globals: Set[Any] = set()
 
-    memo: Dict[Union[int, str], str] = {}
+    memo: Dict[Union[int, str], Any] = {}
+    error: Optional[Exception] = None
     # Scan the data for pickle buffers, stopping when parsing fails or stops making progress
     last_byte = b"dummy"
     while last_byte != b"":
-        # List opcodes
+        # List opcodes one by one, so that the opcodes parsed before a parsing
+        # failure are still examined
+        ops: List[Tuple[Any, Any, Union[int, None]]] = []
+        parse_error: Optional[Exception] = None
         try:
-            ops: List[Tuple[Any, Any, Union[int, None]]] = list(
-                pickletools.genops(data)
-            )
+            for op in pickletools.genops(data):
+                ops.append(op)
         except Exception as e:
-            # Given we can have multiple pickles in a file, we may have already successfully extracted globals from a valid pickle.
-            # Thus return the already found globals in the error & let the caller decide what to do.
-            globals_opt = globals if len(globals) > 0 else None
-            raise GenOpsError(str(e), globals_opt)
-
-        last_byte = data.read(1)
-        data.seek(-1, 1)
+            parse_error = e
+        else:
+            last_byte = data.read(1)
+            data.seek(-1, 1)
 
         # Extract global imports
         for n in range(len(ops)):
-            op = ops[n]
-            op_name = op[0].name
-            op_value: str = op[1]
+            try:
+                _extract_global(ops, n, memo, globals)
+            except Exception as e:
+                # Keep going: a malformed operand must not hide globals that
+                # follow it
+                error = error or e
 
-            if op_name == "MEMOIZE" and n > 0:
-                memo[len(memo)] = ops[n - 1][1]
-            elif op_name in ["PUT", "BINPUT", "LONG_BINPUT"] and n > 0:
-                memo[op_value] = ops[n - 1][1]
-            elif op_name in ("GLOBAL", "INST"):
-                globals.add(tuple(op_value.split(" ", 1)))
-            elif op_name == "STACK_GLOBAL":
-                values: List[str] = []
-                for offset in range(1, n):
-                    if ops[n - offset][0].name in [
-                        "MEMOIZE",
-                        "PUT",
-                        "BINPUT",
-                        "LONG_BINPUT",
-                    ]:
-                        continue
-                    if ops[n - offset][0].name in ["GET", "BINGET", "LONG_BINGET"]:
-                        values.append(memo[int(ops[n - offset][1])])
-                    elif ops[n - offset][0].name not in [
-                        "SHORT_BINUNICODE",
-                        "UNICODE",
-                        "BINUNICODE",
-                        "BINUNICODE8",
-                    ]:
-                        logger.debug(
-                            "Presence of non-string opcode, categorizing as an unknown dangerous import"
-                        )
-                        values.append("unknown")
-                    else:
-                        values.append(ops[n - offset][1])
-                    if len(values) == 2:
-                        break
-                if len(values) != 2:
-                    raise ValueError(
-                        f"Found {len(values)} values for STACK_GLOBAL at position {n} instead of 2."
-                    )
-                globals.add((values[1], values[0]))
+        if parse_error is not None:
+            # The rest of the data cannot be parsed
+            error = error or parse_error
+            break
         if not multiple_pickles:
             break
 
+    if error is not None:
+        raise GenOpsError(str(error), globals if len(globals) > 0 else None)
     return globals
+
+
+def _extract_global(
+    ops: List[Tuple[Any, Any, Union[int, None]]],
+    n: int,
+    memo: Dict[Union[int, str], Any],
+    globals: Set[Any],
+) -> None:
+    op = ops[n]
+    op_name = op[0].name
+    op_value: str = op[1]
+
+    if op_name == "MEMOIZE" and n > 0:
+        memo[len(memo)] = ops[n - 1][1]
+    elif op_name in ["PUT", "BINPUT", "LONG_BINPUT"] and n > 0:
+        memo[op_value] = ops[n - 1][1]
+    elif op_name in ("GLOBAL", "INST"):
+        globals.add(tuple(op_value.split(" ", 1)))
+    elif op_name == "STACK_GLOBAL":
+        values: List[str] = []
+        for offset in range(1, n):
+            if ops[n - offset][0].name in [
+                "MEMOIZE",
+                "PUT",
+                "BINPUT",
+                "LONG_BINPUT",
+            ]:
+                continue
+            if ops[n - offset][0].name in ["GET", "BINGET", "LONG_BINGET"]:
+                value = memo[int(ops[n - offset][1])]
+                if not isinstance(value, str):
+                    logger.debug(
+                        "Memo reference to a non-string value, categorizing as an unknown dangerous import"
+                    )
+                    value = "unknown"
+                values.append(value)
+            elif ops[n - offset][0].name not in [
+                "SHORT_BINUNICODE",
+                "UNICODE",
+                "BINUNICODE",
+                "BINUNICODE8",
+            ]:
+                logger.debug(
+                    "Presence of non-string opcode, categorizing as an unknown dangerous import"
+                )
+                values.append("unknown")
+            else:
+                values.append(ops[n - offset][1])
+            if len(values) == 2:
+                break
+        if len(values) != 2:
+            raise ValueError(
+                f"Found {len(values)} values for STACK_GLOBAL at position {n} instead of 2."
+            )
+        globals.add((values[1], values[0]))
 
 
 def scan_pickle_bytes(
@@ -127,27 +161,25 @@ def scan_pickle_bytes(
     offset: int = 0,
 ) -> ScanResults:
     """Disassemble a Pickle stream and report issues"""
-    issues: List[Issue] = []
     try:
         raw_globals = _list_globals(model.get_stream(offset), multiple_pickles)
     except GenOpsError as e:
-        if e.globals is not None:
-            return _build_scan_result_from_raw_globals(
-                e.globals,
-                model,
-                settings,
-            )
-        return ScanResults(
-            issues,
-            [
-                PickleGenopsError(
-                    scan_name,
-                    f"Parsing error: {e}",
-                    model,
-                )
-            ],
-            [],
+        # Report the globals found before the failure together with the error:
+        # the part of the stream after the failure was not scanned, so it must
+        # not be reported as clean.
+        results = _build_scan_result_from_raw_globals(
+            e.globals or set(),
+            model,
+            settings,
         )
+        results.errors.append(
+            PickleGenopsError(
+                scan_name,
+                f"Parsing error: {e}",
+                model,
+            )
+        )
+        return results
     logger.debug("Global imports in %s: %s", model, raw_globals, settings)
     return _build_scan_result_from_raw_globals(raw_globals, model, settings)
 

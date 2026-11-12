@@ -1,5 +1,6 @@
 import aiohttp
 import bdb
+import collections
 import http.client
 import importlib
 import io
@@ -28,6 +29,7 @@ import zipfile
 
 from modelscan.modelscan import ModelScan
 from modelscan.cli import cli
+from modelscan.error import PickleGenopsError
 from modelscan.issues import (
     Issue,
     IssueCode,
@@ -483,6 +485,105 @@ def test_scan_pickle_bytes() -> None:
 
     model = Model("file.pkl", io.BytesIO(pickle.dumps(Malicious1())))
     assert scan_pickle_bytes(model, settings).issues == expected
+
+
+def _builtins_eval_issue(source: str) -> Issue:
+    return Issue(
+        IssueCode.UNSAFE_OPERATOR,
+        IssueSeverity.CRITICAL,
+        OperatorIssueDetails("builtins", "eval", IssueSeverity.CRITICAL, source),
+    )
+
+
+# A complete pickle that references a global which is not flagged
+benign_pickle_with_global = pickle.dumps(collections.OrderedDict(a=1), protocol=4)
+
+
+def test_scan_pickle_bytes_truncated_stream() -> None:
+    # A loader executes the opcodes it has read before it reaches the end of
+    # a truncated stream, so the globals found so far must be reported, and
+    # the parsing failure too
+    data = pickle.dumps(Malicious1(), protocol=4)[:-1]  # without STOP
+
+    results = scan_pickle_bytes(Model("file.pkl", io.BytesIO(data)), settings)
+
+    assert results.issues == [_builtins_eval_issue("file.pkl")]
+    assert len(results.errors) == 1
+    assert isinstance(results.errors[0], PickleGenopsError)
+
+
+def test_scan_pickle_bytes_parsing_error_after_complete_pickle() -> None:
+    # The bytes after the first pickle cannot be parsed. This must not be
+    # reported as a clean file just because the first pickle produced globals.
+    data = benign_pickle_with_global + b"\xff\xff"
+
+    results = scan_pickle_bytes(Model("file.pkl", io.BytesIO(data)), settings)
+
+    assert results.issues == []
+    assert len(results.errors) == 1
+    assert isinstance(results.errors[0], PickleGenopsError)
+
+
+def test_scan_pickle_bytes_malformed_second_pickle() -> None:
+    data = benign_pickle_with_global + pickle.dumps(Malicious1(), protocol=4)[:-1]
+
+    results = scan_pickle_bytes(Model("file.pkl", io.BytesIO(data)), settings)
+
+    assert results.issues == [_builtins_eval_issue("file.pkl")]
+    assert len(results.errors) == 1
+    assert isinstance(results.errors[0], PickleGenopsError)
+
+
+def test_scan_pickle_bytes_invalid_memo_reference() -> None:
+    # STACK_GLOBAL operand read from a memo index that was never stored
+    # (SHORT_BINUNICODE, MEMOIZE, BINGET 127, STACK_GLOBAL, STOP). It must not
+    # hide the globals of the pickles around it.
+    invalid_memo_reference = b"\x80\x04\x8c\x0bcollections\x94h\x7f\x93."
+    data = invalid_memo_reference + pickle.dumps(Malicious1(), protocol=4)
+
+    results = scan_pickle_bytes(Model("file.pkl", io.BytesIO(data)), settings)
+
+    assert results.issues == [_builtins_eval_issue("file.pkl")]
+    assert len(results.errors) == 1
+    assert isinstance(results.errors[0], PickleGenopsError)
+
+
+def test_scan_pickle_bytes_non_string_memo_value() -> None:
+    # STACK_GLOBAL module operand read from the memo as bytes
+    # (SHORT_BINBYTES, MEMOIZE, BINGET 0, SHORT_BINUNICODE, STACK_GLOBAL, STOP)
+    # is categorized as an unknown import, like a non-string operand that is
+    # not read from the memo
+    bytes_operand = b"\x80\x04C\x0bcollections\x94h\x00\x8c\x0bOrderedDict\x93."
+    data = bytes_operand + pickle.dumps(Malicious1(), protocol=4)
+
+    results = scan_pickle_bytes(Model("file.pkl", io.BytesIO(data)), settings)
+
+    compare_results(
+        results.issues,
+        {
+            _builtins_eval_issue("file.pkl"),
+            Issue(
+                IssueCode.UNSAFE_OPERATOR,
+                IssueSeverity.CRITICAL,
+                OperatorIssueDetails(
+                    "unknown", "OrderedDict", IssueSeverity.CRITICAL, "file.pkl"
+                ),
+            ),
+        },
+    )
+    assert results.errors == []
+
+
+def test_scan_reports_issues_and_errors_together(tmp_path: Path) -> None:
+    path = tmp_path / "truncated.pkl"
+    path.write_bytes(pickle.dumps(Malicious1(), protocol=4)[:-1])
+
+    ms = ModelScan()
+    results = ms.scan(path)
+
+    assert ms.issues.all_issues == [_builtins_eval_issue(str(path))]
+    assert [error["category"] for error in results["errors"]] == ["PICKLE_GENOPS"]
+    assert results["summary"]["scanned"]["scanned_files"] == ["truncated.pkl"]
 
 
 def test_scan_zip(zip_file_path: Any) -> None:
@@ -1398,7 +1499,11 @@ def test_scan_directory_path(file_path: str) -> None:
             "source": "password_protected.zip",
         },
     ]
-    assert results["errors"] == []
+    # malicious14.pkl ends with bytes that are not a pickle: its issue is
+    # reported, and so is the fact that the scanner could not parse the end
+    assert [(error["category"], error["source"]) for error in results["errors"]] == [
+        ("PICKLE_GENOPS", "malicious14.pkl")
+    ]
 
 
 @pytest.mark.parametrize(
