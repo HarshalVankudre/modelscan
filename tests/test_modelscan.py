@@ -506,6 +506,98 @@ def test_scan_zip(zip_file_path: Any) -> None:
     assert ms.issues.all_issues == expected
 
 
+def _zip_with_entries(entries: Dict[str, bytes]) -> bytearray:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as zip:
+        for name, data in entries.items():
+            zip.writestr(name, data)
+    return bytearray(buffer.getvalue())
+
+
+def _local_header_offset(data: bytes, entry_name: str) -> int:
+    with zipfile.ZipFile(io.BytesIO(data)) as zip:
+        return zip.getinfo(entry_name).header_offset
+
+
+def test_scan_zip_unreadable_entry_does_not_hide_other_entries(
+    tmp_path: Path,
+) -> None:
+    data = _zip_with_entries(
+        {
+            "first.txt": b"text",
+            "unreadable.txt": b"text",
+            "data.pkl": pickle.dumps(Malicious1(), protocol=4),
+        }
+    )
+    # Break the local file header signature of the second entry
+    offset = _local_header_offset(data, "unreadable.txt")
+    data[offset : offset + 4] = b"\x00\x00\x00\x00"
+    path = tmp_path / "test.zip"
+    path.write_bytes(data)
+
+    ms = ModelScan()
+    results = ms.scan(path)
+
+    assert ms.issues.all_issues == [
+        Issue(
+            IssueCode.UNSAFE_OPERATOR,
+            IssueSeverity.CRITICAL,
+            OperatorIssueDetails(
+                "builtins", "eval", IssueSeverity.CRITICAL, f"{path}:data.pkl"
+            ),
+        )
+    ]
+    assert results["summary"]["scanned"]["scanned_files"] == ["test.zip:data.pkl"]
+    assert [(error["category"], error["source"]) for error in results["errors"]] == [
+        ("BAD_ZIP", str(Path("test.zip:unreadable.txt")))
+    ]
+
+
+def test_scan_zip_encrypted_entry_does_not_hide_other_entries(
+    tmp_path: Path,
+) -> None:
+    data = _zip_with_entries(
+        {
+            "encrypted.txt": b"text",
+            "data.pkl": pickle.dumps(Malicious1(), protocol=4),
+        }
+    )
+    # Mark the first entry as encrypted in its local and central directory
+    # headers (general purpose bit flag 0)
+    local = _local_header_offset(data, "encrypted.txt")
+    central = data.index(b"PK\x01\x02")
+    data[local + 6] |= 0x01
+    data[central + 8] |= 0x01
+    path = tmp_path / "test.zip"
+    path.write_bytes(data)
+
+    results = ModelScan().scan(path)
+
+    assert [issue["source"] for issue in results["issues"]] == [
+        str(Path("test.zip:data.pkl"))
+    ]
+    assert results["errors"] == []
+    assert [
+        (skipped["category"], skipped["source"])
+        for skipped in results["summary"]["skipped"]["skipped_files"]
+    ] == [("BAD_ZIP", str(Path("test.zip:encrypted.txt")))]
+
+
+def test_scan_zip_that_cannot_be_opened_is_an_error(tmp_path: Path) -> None:
+    path = tmp_path / "test.zip"
+    path.write_bytes(b"PK\x03\x04" + b"\x00" * 64)
+
+    results = ModelScan().scan(path)
+
+    assert [(error["category"], error["source"]) for error in results["errors"]] == [
+        ("BAD_ZIP", "test.zip")
+    ]
+    assert "BAD_ZIP" not in [
+        skipped["category"]
+        for skipped in results["summary"]["skipped"]["skipped_files"]
+    ]
+
+
 def test_scan_pytorch(pytorch_file_path: Any) -> None:
     ms = ModelScan()
     results = ms.scan(Path(f"{pytorch_file_path}/bad_pytorch.pt"))
@@ -1375,8 +1467,8 @@ def test_scan_directory_path(file_path: str) -> None:
         },
         {
             "category": "BAD_ZIP",
-            "description": "Skipping zip file due to error: File 'test.txt' is encrypted, password required for extraction",
-            "source": "password_protected.zip",
+            "description": "Skipping zip entry due to error: File 'test.txt' is encrypted, password required for extraction",
+            "source": str(Path("password_protected.zip:test.txt")),
         },
     ]
     assert results["errors"] == []

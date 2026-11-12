@@ -98,6 +98,12 @@ class NestedZipError(PathError):
         return "NESTED_ZIP"
 
 
+class BadZipError(PathError):
+    @staticmethod
+    def name() -> str:
+        return "BAD_ZIP"
+
+
 class PickleGenopsError(ModelScanScannerError):
     @staticmethod
     def name() -> str:
