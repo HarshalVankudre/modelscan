@@ -114,7 +114,7 @@ class SavedModelScan(ScanBase):
 
 class SavedModelLambdaDetectScan(SavedModelScan):
     def _scan(self, model: Model) -> Optional[ScanResults]:
-        file_name = str(model.get_source()).split("/")[-1]
+        file_name = model.get_source().name
         if file_name != "keras_metadata.pb":
             return None
 
@@ -174,7 +174,7 @@ class SavedModelLambdaDetectScan(SavedModelScan):
 
 class SavedModelTensorflowOpScan(SavedModelScan):
     def _scan(self, model: Model) -> Optional[ScanResults]:
-        file_name = str(model.get_source()).split("/")[-1]
+        file_name = model.get_source().name
         if file_name == "keras_metadata.pb":
             return None
 

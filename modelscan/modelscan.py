@@ -4,7 +4,7 @@ import importlib
 from modelscan.settings import DEFAULT_SETTINGS
 
 from pathlib import Path
-from typing import List, Union, Dict, Any, Optional, Generator
+from typing import List, Union, Dict, Any, Optional, Generator, Set
 from datetime import datetime
 import zipfile
 
@@ -109,7 +109,9 @@ class ModelScan:
                                     )
                                     continue
 
-                                yield Model(file_name, file_io)
+                                member = Model(file_name, file_io)
+                                member.set_context("container", str(model.get_source()))
+                                yield member
                 except (zipfile.BadZipFile, RuntimeError) as e:
                     logger.debug(
                         "Skipping zip file %s, due to error",
@@ -138,27 +140,24 @@ class ModelScan:
         pathlib_path = Path().cwd() if path == "." else Path(path).absolute()
         model_path = Path(pathlib_path)
 
-        all_paths: List[Path] = []
+        # Archives whose members were yielded for scanning. The container is
+        # recorded on each member model rather than recovered by splitting the
+        # member source on ":", which breaks on paths that contain a colon
+        # (e.g. Windows drive letters such as C:\).
+        containers: Set[str] = set()
         for model in self._iterate_models(model_path):
             self._middleware_pipeline.run(model)
             self._scan_source(model)
-            all_paths.append(model.get_source())
+            container = model.get_context("container")
+            if container is not None:
+                containers.add(container)
 
-        if self._skipped:
-            all_skipped_paths = [skipped.source for skipped in self._skipped]
-            for path in all_paths:
-                main_file_path = str(path).split(":")[0]
-
-                if main_file_path == str(path):
-                    continue
-
-                # If main container is skipped, we only add its content to skipped but not the file itself
-                if main_file_path in all_skipped_paths:
-                    self._skipped = [
-                        item for item in self._skipped if item.source != main_file_path
-                    ]
-
-                    continue
+        # If a container's members were scanned, only its content is reported
+        # as skipped, not the container file itself
+        if self._skipped and containers:
+            self._skipped = [
+                item for item in self._skipped if item.source not in containers
+            ]
 
         return self._generate_results()
 
