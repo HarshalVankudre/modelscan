@@ -40,7 +40,6 @@ from modelscan.tools.picklescanner import (
     scan_pickle_bytes,
 )
 
-from modelscan.skip import SkipCategories
 from modelscan.settings import DEFAULT_SETTINGS
 from modelscan.model import Model
 
@@ -630,14 +629,11 @@ def test_scan_pytorch(pytorch_file_path: Any) -> None:
     ms = ModelScan()
     results = ms.scan(Path(f"{pytorch_file_path}/bad_pytorch.pt"))
 
-    assert results["summary"]["skipped"]["skipped_files"] == [
-        {
-            "category": SkipCategories.MAGIC_NUMBER.name,
-            "description": "Invalid magic number",
-            "source": "bad_pytorch.pt",
-        }
-    ]
+    # Not a PyTorch file and not a pickle stream either: reported as a
+    # parsing error instead of being skipped
+    assert results["summary"]["skipped"]["skipped_files"] == []
     assert ms.issues.all_issues == []
+    assert [error["category"] for error in results["errors"]] == ["PICKLE_GENOPS"]
 
     results = ms.scan(Path(f"{pytorch_file_path}/safe_zip_pytorch.pt"))
     assert results["summary"]["scanned"]["scanned_files"] == [
@@ -695,6 +691,34 @@ def test_scan_pytorch(pytorch_file_path: Any) -> None:
         str(Path("unsafe_zip_pytorch.pt:unsafe_zip_pytorch/.data/serialization_id")),
     }
     assert ms.issues.all_issues == expected
+    assert results["errors"] == []
+
+
+@pytest.mark.parametrize("file_extension", [".bin", ".pt", ".pth", ".ckpt"])
+def test_scan_pytorch_extension_with_plain_pickle(
+    tmp_path: Path, file_extension: str
+) -> None:
+    # A plain pickle stream (not written by torch.save()) with a PyTorch file
+    # extension is loaded by torch.load(), so it must be scanned rather than
+    # skipped for not starting with the PyTorch magic number
+    path = tmp_path / f"model{file_extension}"
+    path.write_bytes(
+        pickle.dumps(collections.OrderedDict(a=1), protocol=4)
+        + pickle.dumps(Malicious1(), protocol=4)
+    )
+
+    ms = ModelScan()
+    results = ms.scan(path)
+
+    assert ms.issues.all_issues == [
+        Issue(
+            IssueCode.UNSAFE_OPERATOR,
+            IssueSeverity.CRITICAL,
+            OperatorIssueDetails("builtins", "eval", IssueSeverity.CRITICAL, path),
+        )
+    ]
+    assert results["summary"]["scanned"]["scanned_files"] == [path.name]
+    assert results["summary"]["skipped"]["skipped_files"] == []
     assert results["errors"] == []
 
 

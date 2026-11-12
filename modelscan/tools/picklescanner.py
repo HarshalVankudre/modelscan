@@ -285,17 +285,10 @@ def scan_pytorch(model: Model, settings: Dict[str, Any]) -> ScanResults:
 
     magic = get_magic_number(model.get_stream())
     if magic != MAGIC_NUMBER:
-        return ScanResults(
-            [],
-            [],
-            [
-                ModelScanSkipped(
-                    scan_name,
-                    SkipCategories.MAGIC_NUMBER,
-                    "Invalid magic number",
-                    str(model.get_source()),
-                )
-            ],
-        )
+        # Not a file written by torch.save(). torch.load() still unpickles it
+        # (and so would pickle.load() and similar loaders), so scan it as a
+        # plain pickle stream, like the pickle scanner does, instead of
+        # skipping it.
+        return scan_pickle_bytes(model, settings, scan_name)
 
     return scan_pickle_bytes(model, settings, scan_name, multiple_pickles=False)
